@@ -132,12 +132,12 @@ def load_contacts():
     log(f"Loaded {len(CONTACTS)} contact(s): {', '.join(CONTACTS.keys())}")
 
 
-def resolve_alias(alias: str) -> str | None:
+def resolve_alias(alias: str):
     """Resolve an alias to a real handle. Returns None if not found."""
     return CONTACTS.get(alias.strip().lower())
 
 
-def resolve_handle(handle: str) -> str | None:
+def resolve_handle(handle: str):
     """Resolve a real handle to an alias. Returns None if not in contacts."""
     return HANDLE_TO_ALIAS.get(normalize_handle(handle))
 
@@ -150,7 +150,7 @@ def is_known_handle(handle: str) -> bool:
 # ── Security filtering ──────────────────────────────────────────────────
 
 
-def filter_send_request(params: dict) -> tuple[bool, dict]:
+def filter_send_request(params: dict):
     """
     Validate and transform a send request.
     Resolves alias → real handle. Returns (allowed, modified_params).
@@ -181,7 +181,7 @@ def filter_send_request(params: dict) -> tuple[bool, dict]:
     return False, params
 
 
-def rewrite_notification(params: dict) -> dict | None:
+def rewrite_notification(params: dict):
     """
     Filter and rewrite an inbound notification.
     Replaces real handles with aliases. Returns None if sender not in contacts.
