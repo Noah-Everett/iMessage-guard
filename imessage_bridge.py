@@ -505,8 +505,7 @@ def main():
     def shutdown(signum=None, frame=None):
         log("Shutting down...")
         rpc_manager.stop()
-        server.shutdown()
-        sys.exit(0)
+        os._exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
