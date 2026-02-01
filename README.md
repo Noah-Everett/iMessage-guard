@@ -1,15 +1,26 @@
 # iMessage Guard
 
-A security layer for [`imsg`](https://github.com/steipete/imsg) that restricts iMessage access to a single allowed contact. Designed for AI assistants (like [OpenClaw](https://github.com/openclaw/openclaw)) where you want your bot to message **only you** — even if the underlying `imsg` CLI has full access to Messages.app.
+A security layer for [`imsg`](https://github.com/steipete/imsg) that restricts iMessage access to specific contacts. Real phone numbers and emails stay on the Mac — remote clients (like your AI assistant) only see aliases you define.
+
+## How It Works
+
+You create a `contacts.json` on the Mac with Messages:
+
+```json
+{
+  "noah": "+15551234567",
+  "alice": "alice@icloud.com"
+}
+```
+
+Your AI assistant sees `noah` and `alice` — never the real numbers or emails. Messages to/from anyone not in the contacts file are blocked.
 
 ## Modes
 
-iMessage Guard supports two deployment modes:
-
 | Mode | Use case | Transport | Files |
 |------|----------|-----------|-------|
-| **HTTP Bridge** | OpenClaw on a different machine (VM, server) — no SSH needed | HTTP over network | `imessage_bridge.py` + `imsg_http_proxy.py` |
-| **Stdio Guard** | OpenClaw on the same machine or connected via SSH | Stdio (JSON-RPC) | `imsg_guard.py` |
+| **HTTP Bridge** | OpenClaw on a different machine — no SSH | HTTP over network | `imessage_bridge.py` + `imsg_http_proxy.py` |
+| **Stdio Guard** | OpenClaw on same machine or via SSH | Stdio (JSON-RPC) | `imsg_guard.py` |
 
 ## Requirements
 
@@ -17,17 +28,19 @@ iMessage Guard supports two deployment modes:
 - Python 3.6+ (stdlib only — no `pip install`)
 - [`imsg`](https://github.com/steipete/imsg): `brew install steipete/tap/imsg`
 
+---
+
 ## HTTP Bridge Mode (recommended for remote setups)
 
-Best when OpenClaw runs on a different machine than Messages (e.g., a VM connected via Tailscale).
+Best when OpenClaw runs on a different machine than Messages.
 
 ```
 ┌─────────────────────────────────┐         HTTP         ┌──────────────────────────────────┐
 │ OpenClaw machine (VM/server)    │◄────────────────────►│ Mac with Messages                │
 │                                 │    (Tailscale etc.)  │                                  │
-│ imsg_http_proxy.py (stdio)      │                      │ imessage_bridge.py (HTTP server)  │
-│   └─ called by OpenClaw as      │                      │   └─ manages imsg rpc subprocess  │
-│      channels.imessage.cliPath  │                      │   └─ filters by allowed contact   │
+│ imsg_http_proxy.py              │                      │ imessage_bridge.py               │
+│  └─ OpenClaw sees aliases only  │                      │  └─ contacts.json has real info   │
+│  └─ never sees real numbers     │                      │  └─ manages imsg rpc              │
 └─────────────────────────────────┘                      └──────────────────────────────────┘
 ```
 
@@ -41,34 +54,36 @@ brew install steipete/tap/imsg
 
 # Clone this repo
 git clone https://github.com/Noah-Everett/iMessage-guard.git ~/iMessage-guard
+cd ~/iMessage-guard
+
+# Create your contacts file
+cp contacts.example.json contacts.json
+# Edit contacts.json with your actual contacts:
+#   { "noah": "+15551234567" }
 
 # Start the bridge
-export IMSG_ALLOWED_CONTACT="+15551234567"   # your phone or Apple ID
-export IMSG_BRIDGE_TOKEN="your-secret-token" # pick a strong token
-python3 ~/iMessage-guard/imessage_bridge.py
+export IMSG_CONTACTS_FILE="$HOME/iMessage-guard/contacts.json"
+export IMSG_BRIDGE_TOKEN="pick-a-strong-secret-token"
+python3 imessage_bridge.py
 ```
-
-Grant macOS permissions on first run:
-- **Full Disk Access**: System Settings → Privacy & Security → Full Disk Access → Terminal
-- **Automation**: Approve when prompted (Messages.app control)
 
 **On the OpenClaw machine:**
 
 ```bash
-# Clone this repo
 git clone https://github.com/Noah-Everett/iMessage-guard.git ~/iMessage-guard
 
 # Create a wrapper script
+mkdir -p ~/.openclaw/scripts
 cat > ~/.openclaw/scripts/imsg-bridge << 'EOF'
 #!/usr/bin/env bash
-export IMSG_BRIDGE_URL="http://100.x.y.z:8788"      # Mac's Tailscale IP
-export IMSG_BRIDGE_TOKEN="your-secret-token"          # same token as bridge
+export IMSG_BRIDGE_URL="http://100.x.y.z:8788"      # Mac's IP (Tailscale etc.)
+export IMSG_BRIDGE_TOKEN="pick-a-strong-secret-token" # must match bridge
 exec python3 ~/iMessage-guard/imsg_http_proxy.py "$@"
 EOF
 chmod +x ~/.openclaw/scripts/imsg-bridge
 ```
 
-**Configure OpenClaw:**
+**Configure OpenClaw** (uses aliases, not real numbers):
 
 ```json5
 {
@@ -77,7 +92,7 @@ chmod +x ~/.openclaw/scripts/imsg-bridge
       enabled: true,
       cliPath: "~/.openclaw/scripts/imsg-bridge",
       dmPolicy: "allowlist",
-      allowFrom: ["+15551234567"],
+      allowFrom: ["noah"],           // alias, not phone number
       groupPolicy: "disabled"
     }
   }
@@ -88,130 +103,103 @@ chmod +x ~/.openclaw/scripts/imsg-bridge
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `IMSG_ALLOWED_CONTACT` | **Yes** | — | Phone number or Apple ID email |
-| `IMSG_BRIDGE_TOKEN` | **Yes** | — | Bearer token for authentication |
+| `IMSG_CONTACTS_FILE` | Yes* | — | Path to contacts JSON file |
+| `IMSG_CONTACTS` | Yes* | — | Inline JSON (alternative to file) |
+| `IMSG_BRIDGE_TOKEN` | **Yes** | — | Bearer token for HTTP auth |
 | `IMSG_BRIDGE_HOST` | No | `0.0.0.0` | Bind address |
 | `IMSG_BRIDGE_PORT` | No | `8788` | Listen port |
-| `IMSG_PATH` | No | `/opt/homebrew/bin/imsg` | Path to imsg binary |
+| `IMSG_PATH` | No | `/opt/homebrew/bin/imsg` | Path to imsg |
 | `IMSG_DB_PATH` | No | — | Custom chat.db path |
+
+\* One of `IMSG_CONTACTS_FILE` or `IMSG_CONTACTS` is required.
 
 ### Proxy environment variables
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `IMSG_BRIDGE_URL` | **Yes** | — | Bridge URL (e.g., `http://100.x.y.z:8788`) |
-| `IMSG_BRIDGE_TOKEN` | **Yes** | — | Bearer token (must match bridge) |
-| `IMSG_POLL_MS` | No | `500` | Notification poll interval (ms) |
+| `IMSG_BRIDGE_TOKEN` | **Yes** | — | Must match bridge token |
+| `IMSG_POLL_MS` | No | `500` | Poll interval in ms |
 
 ### Bridge API
 
-#### `GET /health`
-No auth required. Returns bridge status.
-
-#### `POST /rpc`
-Forward a JSON-RPC request to imsg. Returns the JSON-RPC response.
-
-Send requests are validated — only messages to the allowed contact are forwarded.
-
-#### `GET /notifications`
-Returns and clears buffered inbound message notifications. Only notifications from the allowed contact are included.
-
-```json
-{
-  "notifications": [
-    "{\"jsonrpc\":\"2.0\",\"method\":\"message\",\"params\":{...}}"
-  ]
-}
-```
+| Endpoint | Auth | Description |
+|----------|------|-------------|
+| `GET /health` | No | Status + contact alias list |
+| `POST /rpc` | Yes | Forward JSON-RPC to imsg (aliases resolved to real handles) |
+| `GET /notifications` | Yes | Buffered inbound messages (real handles replaced with aliases) |
+| `GET /contacts` | Yes | List contact aliases |
 
 ---
 
-## Stdio Guard Mode (for SSH or local setups)
+## Stdio Guard Mode
 
-Best when OpenClaw can reach `imsg` directly (same machine or via SSH).
-
-```
-OpenClaw → imsg_guard.py → imsg rpc → Messages.app
-```
-
-### Setup
+For when OpenClaw runs on the same Mac or connects via SSH.
 
 ```bash
-export IMSG_ALLOWED_CONTACT="+15551234567"
-python3 imsg_guard.py
+export IMSG_CONTACTS_FILE="contacts.json"
+python3 imsg_guard.py rpc
 ```
 
-### With OpenClaw (local)
+### OpenClaw config (local)
 
 ```bash
 cat > ~/.openclaw/scripts/imsg-guard << 'EOF'
 #!/usr/bin/env bash
-export IMSG_ALLOWED_CONTACT="+15551234567"
-exec python3 /path/to/imsg_guard.py "$@"
+export IMSG_CONTACTS_FILE="$HOME/iMessage-guard/contacts.json"
+exec python3 ~/iMessage-guard/imsg_guard.py "$@"
 EOF
 chmod +x ~/.openclaw/scripts/imsg-guard
 ```
 
-```json5
-{
-  channels: {
-    imessage: {
-      enabled: true,
-      cliPath: "~/.openclaw/scripts/imsg-guard",
-      dmPolicy: "allowlist",
-      allowFrom: ["+15551234567"],
-      groupPolicy: "disabled"
-    }
-  }
-}
-```
-
-### With OpenClaw (SSH)
+### OpenClaw config (SSH)
 
 ```bash
 cat > ~/.openclaw/scripts/imsg-ssh << 'EOF'
 #!/usr/bin/env bash
 exec ssh -o BatchMode=yes -T user@mac-host \
-  "IMSG_ALLOWED_CONTACT='+15551234567' python3 ~/iMessage-guard/imsg_guard.py" "$@"
+  "IMSG_CONTACTS_FILE=~/iMessage-guard/contacts.json python3 ~/iMessage-guard/imsg_guard.py" "$@"
 EOF
-chmod +x ~/.openclaw/scripts/imsg-ssh
 ```
-
-### Stdio Guard environment variables
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `IMSG_ALLOWED_CONTACT` | **Yes** | — | Phone number or Apple ID email |
-| `IMSG_PATH` | No | `/opt/homebrew/bin/imsg` | Path to imsg binary |
 
 ---
 
-## How It Works
+## Contacts File
 
-### Security filtering
+A simple JSON map of alias → handle:
 
-Both modes enforce the same rules:
+```json
+{
+  "noah": "+15551234567",
+  "alice": "alice@icloud.com",
+  "bob": "+44207946000"
+}
+```
 
-- **Outbound `send` requests**: Blocked unless `to` matches the allowed contact
-- **`chat_id`/`chat_guid` targets**: Always blocked (can't verify recipient)
-- **Inbound notifications**: Dropped unless sender matches the allowed contact
-- **Self messages** (`is_from_me`): Dropped
-- All blocked attempts logged to stderr
+- **Aliases** are lowercase, user-defined names
+- **Handles** are phone numbers (E.164) or Apple ID emails
+- Only contacts in this file can send or receive messages
+- The file lives on the Mac with Messages — never shared with remote clients
+- Phone numbers are normalized for matching: `5551234567`, `+15551234567`, `(555) 123-4567` all work
 
-### Handle normalization
+To add/remove contacts, edit the file and restart the bridge.
 
-Phone numbers and emails are normalized before comparison:
-- Service prefixes stripped: `imessage:`, `sms:`, `tel:`
-- Phone numbers: non-digit chars removed, 10-digit US numbers get `+1` prefix
-- Emails: case-insensitive
+---
 
-So `+1 (555) 123-4567`, `5551234567`, and `imessage:+15551234567` all match.
+## Security
+
+| Layer | What it does |
+|-------|-------------|
+| **Contacts file** | Only listed contacts can send/receive — enforced at protocol level |
+| **Alias mapping** | Real handles never leave the Mac; clients only see aliases |
+| **chat_id blocking** | Indirect targets blocked (can't verify recipient) |
+| **Bearer token** (HTTP mode) | Prevents unauthorized access to the bridge API |
+| **OpenClaw `allowFrom`** | Additional layer — OpenClaw ignores messages from unlisted aliases |
+| **Network** | Use Tailscale/VPN, not public internet |
 
 ---
 
 ## Running as a LaunchAgent
-
-To keep the bridge running across reboots on the Mac:
 
 ```bash
 cat > ~/Library/LaunchAgents/com.imessage-guard.bridge.plist << EOF
@@ -228,8 +216,8 @@ cat > ~/Library/LaunchAgents/com.imessage-guard.bridge.plist << EOF
     </array>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>IMSG_ALLOWED_CONTACT</key>
-        <string>+15551234567</string>
+        <key>IMSG_CONTACTS_FILE</key>
+        <string>$HOME/iMessage-guard/contacts.json</string>
         <key>IMSG_BRIDGE_TOKEN</key>
         <string>YOUR_TOKEN_HERE</string>
     </dict>
@@ -250,27 +238,19 @@ launchctl load ~/Library/LaunchAgents/com.imessage-guard.bridge.plist
 
 ---
 
-## Security Summary
-
-| Layer | What it does |
-|-------|-------------|
-| **iMessage Guard** | Blocks at the protocol level — unauthorized messages never reach imsg or the network |
-| **OpenClaw `allowFrom`** | Second layer — OpenClaw ignores messages from anyone not in the list |
-| **OpenClaw `groupPolicy: "disabled"`** | No group chat access |
-| **Bearer token auth** (HTTP mode) | Prevents unauthorized access to the bridge |
-| **Network** | Use Tailscale/VPN, not public internet |
-
 ## Troubleshooting
 
-**Bridge: "imsg not found"** — Set `IMSG_PATH` or install: `brew install steipete/tap/imsg`
+**"imsg not found"** — `brew install steipete/tap/imsg` or set `IMSG_PATH`
 
-**Proxy: "Could not reach bridge"** — Check the bridge is running and the URL/port are correct. Verify Tailscale connectivity.
+**"No contacts configured"** — Set `IMSG_CONTACTS_FILE` or `IMSG_CONTACTS`
 
-**No messages coming through** — Check bridge stderr for "DROPPED" lines. Run `imsg chats --limit 5` on the Mac to verify imsg works. Grant Full Disk Access + Automation permissions.
+**"Could not reach bridge"** — Check bridge is running, URL/port are correct, network (Tailscale) is up
 
-**Sends blocked** — Check bridge stderr for "BLOCKED" lines. Only direct `to` sends are allowed.
+**No messages coming through** — Check stderr for "DROPPED" lines. Verify the sender's handle matches what's in contacts.json (run `imsg chats --limit 5` to see handles).
 
-**Permission prompts** — On first run, open Terminal on the Mac and run `imsg chats --limit 1` to trigger macOS dialogs.
+**Sends blocked** — Check stderr for "BLOCKED" lines. Make sure the alias or handle is in contacts.json.
+
+**macOS permissions** — Run `imsg chats --limit 1` in Terminal on the Mac to trigger Full Disk Access + Automation prompts.
 
 ## License
 

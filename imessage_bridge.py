@@ -5,24 +5,32 @@ iMessage Bridge — HTTP bridge to imsg rpc.
 Runs on the Mac where Messages is signed in. Manages an `imsg rpc` subprocess
 and exposes its JSON-RPC interface over HTTP, with contact-based security filtering.
 
-This lets a remote client (like the imsg_http_proxy) talk to imsg over HTTP
-instead of needing direct stdio/SSH access.
+Real phone numbers / emails stay on this machine. Remote clients only see
+aliases (e.g. "noah", "alice") defined in the contacts file.
 
 Usage:
-    IMSG_ALLOWED_CONTACT="+15551234567" IMSG_BRIDGE_TOKEN="secret" python3 imessage_bridge.py
+    IMSG_CONTACTS_FILE="contacts.json" IMSG_BRIDGE_TOKEN="secret" python3 imessage_bridge.py
 
 Environment variables:
-    IMSG_ALLOWED_CONTACT  Phone number or Apple ID email (required)
+    IMSG_CONTACTS_FILE    Path to contacts JSON file (required unless IMSG_CONTACTS set)
+    IMSG_CONTACTS         Inline JSON contacts map (alternative to file)
     IMSG_BRIDGE_TOKEN     Bearer token for HTTP auth (required)
     IMSG_BRIDGE_HOST      Bind address (default: 0.0.0.0)
     IMSG_BRIDGE_PORT      Listen port (default: 8788)
     IMSG_PATH             Path to imsg binary (default: /opt/homebrew/bin/imsg)
     IMSG_DB_PATH          Path to chat.db (optional, passed to imsg)
 
+Contacts file format (JSON):
+    {
+      "noah": "+15551234567",
+      "alice": "alice@icloud.com"
+    }
+
 Endpoints:
     GET  /health          — Health check (no auth)
     POST /rpc             — Forward a JSON-RPC request to imsg, return response
     GET  /notifications   — Return buffered inbound notifications, clear buffer
+    GET  /contacts        — List available contact aliases (no real handles exposed)
 """
 
 import http.server
@@ -32,13 +40,11 @@ import signal
 import subprocess
 import sys
 import threading
-import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 # ── Config ──────────────────────────────────────────────────────────────
 
-ALLOWED_CONTACT = os.environ.get("IMSG_ALLOWED_CONTACT", "")
 BRIDGE_TOKEN = os.environ.get("IMSG_BRIDGE_TOKEN", "")
 BRIDGE_HOST = os.environ.get("IMSG_BRIDGE_HOST", "0.0.0.0")
 BRIDGE_PORT = int(os.environ.get("IMSG_BRIDGE_PORT", "8788"))
@@ -50,14 +56,16 @@ NOTIFICATION_BUFFER_MAX = 500
 # Timeout waiting for an RPC response (seconds)
 RPC_TIMEOUT = 15
 
-if not ALLOWED_CONTACT:
-    print("ERROR: IMSG_ALLOWED_CONTACT is required", file=sys.stderr)
-    sys.exit(1)
 if not BRIDGE_TOKEN:
     print("ERROR: IMSG_BRIDGE_TOKEN is required", file=sys.stderr)
     sys.exit(1)
 
-# ── Contact filtering ───────────────────────────────────────────────────
+# ── Contacts ────────────────────────────────────────────────────────────
+
+# alias -> real handle (phone/email)
+CONTACTS = {}
+# real handle (normalized) -> alias (reverse lookup)
+HANDLE_TO_ALIAS = {}
 
 
 def normalize_handle(handle: str) -> str:
@@ -76,52 +84,157 @@ def normalize_handle(handle: str) -> str:
     return h
 
 
-def is_allowed(handle: str) -> bool:
-    if not handle or not ALLOWED_CONTACT:
-        return False
-    return normalize_handle(handle) == normalize_handle(ALLOWED_CONTACT)
+def load_contacts():
+    """Load contacts from file or env var."""
+    global CONTACTS, HANDLE_TO_ALIAS
+
+    raw = None
+    contacts_file = os.environ.get("IMSG_CONTACTS_FILE", "")
+    contacts_inline = os.environ.get("IMSG_CONTACTS", "")
+
+    if contacts_file:
+        try:
+            with open(contacts_file) as f:
+                raw = json.load(f)
+        except FileNotFoundError:
+            print(f"ERROR: Contacts file not found: {contacts_file}", file=sys.stderr)
+            sys.exit(1)
+        except json.JSONDecodeError as e:
+            print(f"ERROR: Invalid JSON in contacts file: {e}", file=sys.stderr)
+            sys.exit(1)
+    elif contacts_inline:
+        try:
+            raw = json.loads(contacts_inline)
+        except json.JSONDecodeError as e:
+            print(f"ERROR: Invalid IMSG_CONTACTS JSON: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    if not raw or not isinstance(raw, dict):
+        print("ERROR: No contacts configured.", file=sys.stderr)
+        print("Set IMSG_CONTACTS_FILE=/path/to/contacts.json or IMSG_CONTACTS='{...}'",
+              file=sys.stderr)
+        sys.exit(1)
+
+    CONTACTS = {}
+    HANDLE_TO_ALIAS = {}
+    for alias, handle in raw.items():
+        alias = alias.strip().lower()
+        handle = handle.strip()
+        if not alias or not handle:
+            continue
+        CONTACTS[alias] = handle
+        HANDLE_TO_ALIAS[normalize_handle(handle)] = alias
+
+    if not CONTACTS:
+        print("ERROR: Contacts file is empty", file=sys.stderr)
+        sys.exit(1)
+
+    log(f"Loaded {len(CONTACTS)} contact(s): {', '.join(CONTACTS.keys())}")
 
 
-def is_allowed_send(params: dict) -> bool:
-    """Check if a send request targets the allowed contact."""
-    to = params.get("to", "")
-    if to and is_allowed(to):
-        return True
+def resolve_alias(alias: str) -> str | None:
+    """Resolve an alias to a real handle. Returns None if not found."""
+    return CONTACTS.get(alias.strip().lower())
+
+
+def resolve_handle(handle: str) -> str | None:
+    """Resolve a real handle to an alias. Returns None if not in contacts."""
+    return HANDLE_TO_ALIAS.get(normalize_handle(handle))
+
+
+def is_known_handle(handle: str) -> bool:
+    """Check if a handle belongs to any contact."""
+    return normalize_handle(handle) in HANDLE_TO_ALIAS
+
+
+# ── Security filtering ──────────────────────────────────────────────────
+
+
+def filter_send_request(params: dict) -> tuple[bool, dict]:
+    """
+    Validate and transform a send request.
+    Resolves alias → real handle. Returns (allowed, modified_params).
+    """
+    to = params.get("to", "").strip()
+
+    # Block indirect targets
     if params.get("chat_id") or params.get("chat_guid") or params.get("chat_identifier"):
-        log("BLOCKED send: chat_id/chat_guid targets not allowed")
-        return False
-    if to:
-        log(f"BLOCKED send to {to}: not in allowlist")
-    return False
+        log("BLOCKED send: chat_id/chat_guid/chat_identifier targets not allowed")
+        return False, params
+
+    if not to:
+        log("BLOCKED send: no 'to' field")
+        return False, params
+
+    # Try alias resolution first
+    real_handle = resolve_alias(to)
+    if real_handle:
+        modified = dict(params)
+        modified["to"] = real_handle
+        return True, modified
+
+    # Try direct handle (might be a real number/email that's in contacts)
+    if is_known_handle(to):
+        return True, params
+
+    log(f"BLOCKED send to '{to}': not a known contact alias or handle")
+    return False, params
 
 
-def extract_sender(params: dict) -> str:
-    """Extract sender from a notification."""
-    msg = params.get("message", params)
-    if isinstance(msg, dict):
-        for key in ("sender", "handle", "from", "address"):
-            val = msg.get(key, "")
-            if isinstance(val, str) and val.strip():
-                return val.strip()
+def rewrite_notification(params: dict) -> dict | None:
+    """
+    Filter and rewrite an inbound notification.
+    Replaces real handles with aliases. Returns None if sender not in contacts.
+    """
+    msg = params.get("message", {})
+    if not isinstance(msg, dict):
+        return None
+
+    # Skip self messages
+    if msg.get("is_from_me"):
+        return None
+
+    # Find sender
+    sender = ""
     for key in ("sender", "handle", "from", "address"):
-        val = params.get(key, "")
+        val = msg.get(key, "")
         if isinstance(val, str) and val.strip():
-            return val.strip()
-    return ""
+            sender = val.strip()
+            break
 
+    if not sender:
+        # Check top-level params too
+        for key in ("sender", "handle", "from", "address"):
+            val = params.get(key, "")
+            if isinstance(val, str) and val.strip():
+                sender = val.strip()
+                break
 
-def is_allowed_notification(params: dict) -> bool:
-    """Check if an incoming notification is from the allowed contact."""
-    # Skip messages from self
-    msg = params.get("message", params)
-    if isinstance(msg, dict) and msg.get("is_from_me"):
-        return False
-    sender = extract_sender(params)
-    if sender and is_allowed(sender):
-        return True
-    if sender:
-        log(f"DROPPED notification from {sender}: not in allowlist")
-    return False
+    if not sender:
+        return None
+
+    # Resolve to alias
+    alias = resolve_handle(sender)
+    if not alias:
+        log(f"DROPPED notification from {sender}: not in contacts")
+        return None
+
+    # Rewrite: replace real handle with alias in the notification
+    rewritten = json.loads(json.dumps(params))  # deep copy
+
+    # Rewrite message-level sender fields
+    rewritten_msg = rewritten.get("message", {})
+    if isinstance(rewritten_msg, dict):
+        for key in ("sender", "handle", "from", "address"):
+            if key in rewritten_msg:
+                rewritten_msg[key] = alias
+
+    # Rewrite top-level sender fields
+    for key in ("sender", "handle", "from", "address"):
+        if key in rewritten:
+            rewritten[key] = alias
+
+    return rewritten
 
 
 # ── Logging ─────────────────────────────────────────────────────────────
@@ -141,7 +254,7 @@ class ImsgRpcManager:
     def __init__(self):
         self.proc = None
         self.stdin_lock = threading.Lock()
-        self.pending = {}  # id -> threading.Event, result holder
+        self.pending = {}
         self.pending_lock = threading.Lock()
         self.notifications = []
         self.notifications_lock = threading.Lock()
@@ -182,7 +295,7 @@ class ImsgRpcManager:
             self.proc = None
 
     def _read_stdout(self):
-        """Read lines from imsg stdout, route to pending requests or notification buffer."""
+        """Read from imsg stdout, route responses and buffer notifications."""
         try:
             for line in self.proc.stdout:
                 line = line.strip()
@@ -205,19 +318,27 @@ class ImsgRpcManager:
                             entry["event"].set()
                             continue
 
-                # Notification
+                # Notification — filter and rewrite
                 method = msg.get("method", "")
                 params = msg.get("params", {})
 
                 if method in ("message", "new_message", "message_received"):
-                    if not is_allowed_notification(params):
+                    rewritten = rewrite_notification(params)
+                    if rewritten is None:
                         continue
-
-                with self.notifications_lock:
-                    self.notifications.append(json.dumps(msg))
-                    # Trim if too large
-                    if len(self.notifications) > NOTIFICATION_BUFFER_MAX:
-                        self.notifications = self.notifications[-NOTIFICATION_BUFFER_MAX:]
+                    # Store the rewritten notification
+                    rewritten_msg = dict(msg)
+                    rewritten_msg["params"] = rewritten
+                    with self.notifications_lock:
+                        self.notifications.append(json.dumps(rewritten_msg))
+                        if len(self.notifications) > NOTIFICATION_BUFFER_MAX:
+                            self.notifications = self.notifications[-NOTIFICATION_BUFFER_MAX:]
+                else:
+                    # Non-message notifications pass through
+                    with self.notifications_lock:
+                        self.notifications.append(json.dumps(msg))
+                        if len(self.notifications) > NOTIFICATION_BUFFER_MAX:
+                            self.notifications = self.notifications[-NOTIFICATION_BUFFER_MAX:]
 
         except Exception as e:
             if self.running:
@@ -230,22 +351,28 @@ class ImsgRpcManager:
                     "error": {"code": -32000, "message": "imsg rpc not running"}}
 
         req_id = request.get("id")
+        method = request.get("method", "")
+        params = request.get("params", {})
+
+        # No id = notification from client, just forward
         if req_id is None:
-            # Notification from client — just forward, no response expected
             with self.stdin_lock:
                 self.proc.stdin.write(json.dumps(request) + "\n")
                 self.proc.stdin.flush()
             return {}
 
-        # Security check for send requests
-        method = request.get("method", "")
-        params = request.get("params", {})
-        if method == "send" and not is_allowed_send(params):
-            return {
-                "jsonrpc": "2.0", "id": req_id,
-                "error": {"code": -32001,
-                           "message": "Blocked by iMessage bridge: recipient not in allowlist"}
-            }
+        # Security: validate and transform send requests
+        if method == "send":
+            allowed, modified_params = filter_send_request(params)
+            if not allowed:
+                return {
+                    "jsonrpc": "2.0", "id": req_id,
+                    "error": {"code": -32001,
+                               "message": "Blocked by iMessage bridge: recipient not in contacts"}
+                }
+            # Use modified params (alias resolved to real handle)
+            request = dict(request)
+            request["params"] = modified_params
 
         # Register pending response
         key = str(req_id)
@@ -256,18 +383,16 @@ class ImsgRpcManager:
             self.pending[key] = entry
 
         try:
-            # Send request
             with self.stdin_lock:
                 self.proc.stdin.write(json.dumps(request) + "\n")
                 self.proc.stdin.flush()
 
-            # Wait for response
             if event.wait(timeout=timeout):
                 return entry["result"]
             else:
                 return {
                     "jsonrpc": "2.0", "id": req_id,
-                    "error": {"code": -32000, "message": f"Timeout waiting for response ({timeout}s)"}
+                    "error": {"code": -32000, "message": f"Timeout ({timeout}s)"}
                 }
         finally:
             with self.pending_lock:
@@ -321,7 +446,7 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, {
                 "status": "ok",
                 "imsg_alive": rpc_manager.is_alive,
-                "allowed_contact": ALLOWED_CONTACT,
+                "contacts": list(CONTACTS.keys()),
                 "timestamp": datetime.now(timezone.utc).isoformat()
             })
             return
@@ -333,6 +458,12 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
         if path == "/notifications":
             notifications = rpc_manager.drain_notifications()
             self._send_json(200, {"notifications": notifications})
+            return
+
+        if path == "/contacts":
+            self._send_json(200, {
+                "contacts": list(CONTACTS.keys())
+            })
             return
 
         self._send_json(404, {"error": "Not found"})
@@ -365,11 +496,11 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
 
 
 def main():
+    load_contacts()
     rpc_manager.start()
 
     server = http.server.HTTPServer((BRIDGE_HOST, BRIDGE_PORT), BridgeHandler)
     log(f"iMessage Bridge listening on {BRIDGE_HOST}:{BRIDGE_PORT}")
-    log(f"Allowed contact: {ALLOWED_CONTACT}")
 
     def shutdown(signum=None, frame=None):
         log("Shutting down...")
