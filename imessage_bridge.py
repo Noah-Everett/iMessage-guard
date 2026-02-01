@@ -190,9 +190,11 @@ def rewrite_notification(params: dict):
     if not isinstance(msg, dict):
         return None
 
-    # Skip self messages
-    if msg.get("is_from_me"):
-        return None
+    # Skip self messages — check multiple locations and formats
+    for obj in [msg, params]:
+        from_me = obj.get("is_from_me")
+        if from_me is True or from_me == 1 or from_me == "true" or from_me == "1":
+            return None
 
     # Find sender
     sender = ""
