@@ -286,6 +286,26 @@ class ImsgRpcManager:
         self.reader_thread.start()
         log(f"imsg rpc started (pid {self.proc.pid})")
 
+        # Auto-subscribe to watch for incoming messages
+        self._auto_subscribe()
+
+    def _auto_subscribe(self):
+        """Subscribe to message watch on startup so inbound messages flow immediately."""
+        try:
+            result = self.send_request({
+                "jsonrpc": "2.0",
+                "id": -1,
+                "method": "watch.subscribe",
+                "params": {"attachments": False}
+            }, timeout=10)
+            sub_id = (result or {}).get("result", {}).get("subscription")
+            if sub_id is not None:
+                log(f"Auto-subscribed to watch (subscription={sub_id})")
+            else:
+                log(f"Watch subscribe response: {result}")
+        except Exception as e:
+            log(f"Warning: auto-subscribe failed: {e}")
+
     def stop(self):
         self.running = False
         if self.proc:
